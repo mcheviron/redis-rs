@@ -111,20 +111,35 @@ impl TryFrom<Bytes> for RespValue {
             }
             b'*' => {
                 bytes.advance(1);
+
                 let len_end = bytes
                     .iter()
                     .position(|&b| b == b'\r')
                     .ok_or_else(|| RespError::Parse("Invalid array format".to_string()))?;
+
                 let len = String::from_utf8(bytes.split_to(len_end).to_vec())
                     .map_err(|e| RespError::Parse(e.to_string()))?
                     .parse::<usize>()
                     .map_err(|e| RespError::Parse(e.to_string()))?;
-                bytes.advance(2); // Skip \r\n
+
+                bytes.advance(2);
+
                 let mut array = Vec::with_capacity(len);
+
                 for _ in 0..len {
                     array.push(RespValue::try_from(bytes.clone())?);
-                    bytes.advance(Bytes::from(array.last().unwrap().clone()).len());
+
+                    bytes.advance(
+                        Bytes::from(
+                            array
+                                .last()
+                                .ok_or_else(|| RespError::Parse("Empty array".to_string()))?
+                                .clone(),
+                        )
+                        .len(),
+                    );
                 }
+
                 Ok(RespValue::Array(array))
             }
             _ => Err(RespError::Parse("Invalid RESP data type".to_string())),
