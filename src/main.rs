@@ -34,14 +34,35 @@ async fn process(mut socket: TcpStream) -> Result<(), Box<dyn Error>> {
         match RespValue::try_from(request) {
             Ok(RespValue::Array(values)) => {
                 if let Some(RespValue::BulkString(Some(command))) = values.first() {
-                    if command == "PING".as_bytes() {
-                        let response = RespValue::SimpleString("PONG".to_string());
-                        let response_bytes = Bytes::from(response);
-                        socket.write_all(&response_bytes).await?;
-                    } else {
-                        let error = RespValue::Error("Unknown command".to_string());
-                        let error_bytes = Bytes::from(error);
-                        socket.write_all(&error_bytes).await?;
+                    let command_str = String::from_utf8_lossy(command);
+                    match command_str.to_ascii_lowercase().as_str() {
+                        "ping" => {
+                            let response =
+                                if let Some(RespValue::BulkString(Some(arg))) = values.get(1) {
+                                    RespValue::BulkString(Some(arg.clone()))
+                                } else {
+                                    RespValue::SimpleString("PONG".to_string())
+                                };
+                            let response_bytes = Bytes::from(response);
+                            socket.write_all(&response_bytes).await?;
+                        }
+                        "echo" => {
+                            if let Some(RespValue::BulkString(Some(arg))) = values.get(1) {
+                                let response = RespValue::BulkString(Some(arg.clone()));
+                                let response_bytes = Bytes::from(response);
+                                socket.write_all(&response_bytes).await?;
+                            } else {
+                                let error =
+                                    RespValue::Error("Invalid ECHO command format".to_string());
+                                let error_bytes = Bytes::from(error);
+                                socket.write_all(&error_bytes).await?;
+                            }
+                        }
+                        _ => {
+                            let error = RespValue::Error("Unknown command".to_string());
+                            let error_bytes = Bytes::from(error);
+                            socket.write_all(&error_bytes).await?;
+                        }
                     }
                 } else {
                     let error = RespValue::Error("Invalid command format".to_string());
