@@ -1,5 +1,5 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::io::{self};
+use std::io;
 use thiserror::Error;
 
 #[derive(Debug, PartialEq, Clone)]
