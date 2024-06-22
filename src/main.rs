@@ -1,7 +1,10 @@
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
-use std::error::Error;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    error::Error,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -11,7 +14,7 @@ use tokio::{
 mod resp;
 use resp::RespValue;
 
-type DB = Arc<Mutex<HashMap<String, Bytes>>>;
+type DB = Arc<Mutex<HashMap<String, (Bytes, Option<Instant>)>>>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -71,13 +74,23 @@ async fn process(mut socket: TcpStream, db: DB) -> Result<(), Box<dyn Error>> {
                         "get" => {
                             if let Some(RespValue::BulkString(Some(key))) = values.get(1) {
                                 let key_str = String::from_utf8_lossy(key);
-                                let db_guard = db.lock().await;
-                                let response =
-                                    if let Some(value) = db_guard.get(&key_str.to_string()) {
-                                        RespValue::BulkString(Some(value.clone()))
+                                let mut db_guard = db.lock().await;
+                                let response = if let Some((value, expiry)) =
+                                    db_guard.get(&key_str.to_string())
+                                {
+                                    if let Some(exp) = expiry {
+                                        if Instant::now() > *exp {
+                                            db_guard.remove(&key_str.to_string());
+                                            RespValue::BulkString(None)
+                                        } else {
+                                            RespValue::BulkString(Some(value.clone()))
+                                        }
                                     } else {
-                                        RespValue::BulkString(None)
-                                    };
+                                        RespValue::BulkString(Some(value.clone()))
+                                    }
+                                } else {
+                                    RespValue::BulkString(None)
+                                };
                                 let response_bytes = Bytes::from(response);
                                 socket.write_all(&response_bytes).await?;
                             } else {
@@ -87,25 +100,48 @@ async fn process(mut socket: TcpStream, db: DB) -> Result<(), Box<dyn Error>> {
                                 socket.write_all(&error_bytes).await?;
                             }
                         }
+
                         "set" => {
-                            if let (
-                                Some(RespValue::BulkString(Some(key))),
-                                Some(RespValue::BulkString(Some(value))),
-                            ) = (values.get(1), values.get(2))
-                            {
-                                let key_str = String::from_utf8_lossy(key).to_string();
-                                let mut db_guard = db.lock().await;
-                                db_guard.insert(key_str, value.clone());
-                                let response = RespValue::SimpleString("OK".to_string());
-                                let response_bytes = Bytes::from(response);
-                                socket.write_all(&response_bytes).await?;
-                            } else {
-                                let error =
-                                    RespValue::Error("Invalid SET command format".to_string());
-                                let error_bytes = Bytes::from(error);
-                                socket.write_all(&error_bytes).await?;
+                            match (values.get(1), values.get(2), values.get(3), values.get(4)) {
+                                (
+                                    Some(RespValue::BulkString(Some(key))),
+                                    Some(RespValue::BulkString(Some(value))),
+                                    Some(RespValue::BulkString(Some(px_bytes))),
+                                    Some(RespValue::BulkString(Some(ms))),
+                                ) if px_bytes.to_ascii_lowercase() == b"px" => {
+                                    let key_str = String::from_utf8_lossy(key).to_string();
+                                    let mut db_guard = db.lock().await;
+                                    let expiry = String::from_utf8_lossy(ms)
+                                        .parse::<u64>()
+                                        .map(|ms| Instant::now() + Duration::from_millis(ms))
+                                        .ok();
+                                    db_guard.insert(key_str, (value.clone(), expiry));
+                                    let response = RespValue::SimpleString("OK".to_string());
+                                    let response_bytes = Bytes::from(response);
+                                    socket.write_all(&response_bytes).await?;
+                                }
+                                (
+                                    Some(RespValue::BulkString(Some(key))),
+                                    Some(RespValue::BulkString(Some(value))),
+                                    None,
+                                    None,
+                                ) => {
+                                    let key_str = String::from_utf8_lossy(key).to_string();
+                                    let mut db_guard = db.lock().await;
+                                    db_guard.insert(key_str, (value.clone(), None));
+                                    let response = RespValue::SimpleString("OK".to_string());
+                                    let response_bytes = Bytes::from(response);
+                                    socket.write_all(&response_bytes).await?;
+                                }
+                                _ => {
+                                    let error =
+                                        RespValue::Error("Invalid SET command format".to_string());
+                                    let error_bytes = Bytes::from(error);
+                                    socket.write_all(&error_bytes).await?;
+                                }
                             }
                         }
+
                         _ => {
                             let error = RespValue::Error("Unknown command".to_string());
                             let error_bytes = Bytes::from(error);
