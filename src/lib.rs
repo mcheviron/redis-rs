@@ -155,9 +155,13 @@ pub struct Cli {
     port: Option<u16>,
 }
 
+#[derive(Clone)]
 pub struct ServerConfig {
     pub port: u16,
     pub is_slave: bool,
+    pub role: String,
+    pub master_replid: String,
+    pub master_repl_offset: i64,
 }
 
 
@@ -167,10 +171,16 @@ impl ServerConfig {
             Some(port) => ServerConfig {
                 port,
                 is_slave: true,
+                role: "slave".to_string(),
+                master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), // Example value
+                master_repl_offset: 0,
             },
             None => ServerConfig {
                 port: 6379,
                 is_slave: false,
+                role: "master".to_string(),
+                master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), // Example value
+                master_repl_offset: 0,
             },
         }
     }

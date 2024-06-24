@@ -15,6 +15,7 @@ use tokio::{
 enum DbOperation {
     Get(String, oneshot::Sender<Option<(Bytes, Option<Instant>)>>),
     Set(String, Bytes, Option<Instant>, oneshot::Sender<()>),
+    Info(String, oneshot::Sender<String>),
 }
 
 #[tokio::main]
@@ -33,7 +34,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (db_sender, db_receiver) = async_channel::unbounded();
 
-    tokio::spawn(run_database(db_receiver));
+    tokio::spawn(run_database(config, db_receiver));
 
     loop {
         let (socket, _) = listener.accept().await?;
@@ -175,6 +176,24 @@ async fn process(
                             }
                         }
 
+                        "info" => {
+                            if let Some(RespValue::BulkString(Some(section))) = values.get(1) {
+                                let section_str = String::from_utf8_lossy(section).to_string();
+                                let (response_sender, response_receiver) = oneshot::channel();
+                                db_sender
+                                    .send(DbOperation::Info(section_str, response_sender))
+                                    .await?;
+                                let info = response_receiver.await?;
+                                let response = RespValue::BulkString(Some(Bytes::from(info)));
+                                let response_bytes = Bytes::from(response);
+                                socket.write_all(&response_bytes).await?;
+                            } else {
+                                let error = RespValue::Error("Invalid INFO command format".to_string());
+                                let error_bytes = Bytes::from(error);
+                                socket.write_all(&error_bytes).await?;
+                            }
+                        }
+
                         _ => {
                             let error = RespValue::Error("Unknown command".to_string());
                             let error_bytes = Bytes::from(error);
@@ -200,7 +219,7 @@ async fn process(
         }
     }
 }
-async fn run_database(db_receiver: async_channel::Receiver<DbOperation>) {
+async fn run_database(config: ServerConfig, db_receiver: async_channel::Receiver<DbOperation>) {
     let mut db = HashMap::new();
 
     while let Ok(operation) = db_receiver.recv().await {
@@ -212,6 +231,17 @@ async fn run_database(db_receiver: async_channel::Receiver<DbOperation>) {
             DbOperation::Set(key, value, expiry, response_sender) => {
                 db.insert(key, (value, expiry));
                 let _ = response_sender.send(());
+            }
+            DbOperation::Info(section, response_sender) => {
+                if section.to_lowercase() == "replication" {
+                    let info = format!(
+                        "# Replication\r\nrole:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}",
+                        config.role, config.master_replid, config.master_repl_offset
+                    );
+                    let _ = response_sender.send(info);
+                } else {
+                    let _ = response_sender.send("ERR Unknown section".to_string());
+                }
             }
         }
     }
