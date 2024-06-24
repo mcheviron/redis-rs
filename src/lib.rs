@@ -153,6 +153,9 @@ impl TryFrom<Bytes> for RespValue {
 pub struct Cli {
     #[arg(long)]
     port: Option<u16>,
+
+    #[arg(long)]
+    replicaof: Option<String>,
 }
 
 #[derive(Clone)]
@@ -164,24 +167,18 @@ pub struct ServerConfig {
     pub master_repl_offset: i64,
 }
 
-
 impl ServerConfig {
     pub fn new(cli: &Cli) -> Self {
-        match cli.port {
-            Some(port) => ServerConfig {
-                port,
-                is_slave: true,
-                role: "slave".to_string(),
-                master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), // Example value
-                master_repl_offset: 0,
-            },
-            None => ServerConfig {
-                port: 6379,
-                is_slave: false,
-                role: "master".to_string(),
-                master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), // Example value
-                master_repl_offset: 0,
-            },
+        let port = cli.port.unwrap_or(6379);
+        let is_slave = cli.replicaof.is_some();
+        let role = if is_slave { "slave" } else { "master" };
+
+        ServerConfig {
+            port,
+            is_slave,
+            role: role.to_string(),
+            master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
+            master_repl_offset: 0,
         }
     }
 }
