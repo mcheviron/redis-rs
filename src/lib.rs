@@ -1,4 +1,5 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use clap::Parser;
 use std::io;
 use thiserror::Error;
 
@@ -143,6 +144,34 @@ impl TryFrom<Bytes> for RespValue {
                 Ok(RespValue::Array(array))
             }
             _ => Err(RespError::Parse("Invalid RESP data type".to_string())),
+        }
+    }
+}
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+pub struct Cli {
+    #[arg(long)]
+    port: Option<u16>,
+}
+
+pub struct ServerConfig {
+    pub port: u16,
+    pub is_slave: bool,
+}
+
+
+impl ServerConfig {
+    pub fn new(cli: &Cli) -> Self {
+        match cli.port {
+            Some(port) => ServerConfig {
+                port,
+                is_slave: true,
+            },
+            None => ServerConfig {
+                port: 6379,
+                is_slave: false,
+            },
         }
     }
 }

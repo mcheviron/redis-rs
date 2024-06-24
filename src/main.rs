@@ -1,40 +1,55 @@
 use bytes::{Bytes, BytesMut};
+use clap::Parser;
+use redis_starter_rust::*;
 use std::{
     collections::HashMap,
     error::Error,
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    sync::oneshot,
 };
 
-mod resp;
-use resp::RespValue;
-
-type DB = Arc<Mutex<HashMap<String, (Bytes, Option<Instant>)>>>;
+enum DbOperation {
+    Get(String, oneshot::Sender<Option<(Bytes, Option<Instant>)>>),
+    Set(String, Bytes, Option<Instant>, oneshot::Sender<()>),
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind("127.0.0.1:6379").await?;
-    println!("Listening on 127.0.0.1:6379");
+    let cli = Cli::parse();
+    let config = ServerConfig::new(&cli);
 
-    let db = Arc::new(Mutex::new(HashMap::new()));
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", config.port)).await?;
+    println!("Listening on 127.0.0.1:{}", config.port);
+
+    if config.is_slave {
+        println!("Running as slave");
+    } else {
+        println!("Running as master");
+    }
+
+    let (db_sender, db_receiver) = async_channel::unbounded();
+
+    tokio::spawn(run_database(db_receiver));
 
     loop {
         let (socket, _) = listener.accept().await?;
-        let db_clone = Arc::clone(&db);
+        let db_sender = db_sender.clone();
         tokio::spawn(async move {
-            if let Err(e) = process(socket, db_clone).await {
+            if let Err(e) = process(socket, db_sender).await {
                 eprintln!("Error processing connection: {}", e);
             }
         });
     }
 }
 
-async fn process(mut socket: TcpStream, db: DB) -> Result<(), Box<dyn Error>> {
+async fn process(
+    mut socket: TcpStream,
+    db_sender: async_channel::Sender<DbOperation>,
+) -> Result<(), Box<dyn Error>> {
     let mut buffer = BytesMut::with_capacity(1024);
 
     loop {
@@ -73,23 +88,24 @@ async fn process(mut socket: TcpStream, db: DB) -> Result<(), Box<dyn Error>> {
                         }
                         "get" => {
                             if let Some(RespValue::BulkString(Some(key))) = values.get(1) {
-                                let key_str = String::from_utf8_lossy(key);
-                                let mut db_guard = db.lock().await;
-                                let response = if let Some((value, expiry)) =
-                                    db_guard.get(&key_str.to_string())
-                                {
-                                    if let Some(exp) = expiry {
-                                        if Instant::now() > *exp {
-                                            db_guard.remove(&key_str.to_string());
-                                            RespValue::BulkString(None)
+                                let key_str = String::from_utf8_lossy(key).to_string();
+                                let (response_sender, response_receiver) = oneshot::channel();
+                                db_sender
+                                    .send(DbOperation::Get(key_str, response_sender))
+                                    .await?;
+                                let response = match response_receiver.await? {
+                                    Some((value, expiry)) => {
+                                        if let Some(exp) = expiry {
+                                            if Instant::now() > exp {
+                                                RespValue::BulkString(None)
+                                            } else {
+                                                RespValue::BulkString(Some(value))
+                                            }
                                         } else {
-                                            RespValue::BulkString(Some(value.clone()))
+                                            RespValue::BulkString(Some(value))
                                         }
-                                    } else {
-                                        RespValue::BulkString(Some(value.clone()))
                                     }
-                                } else {
-                                    RespValue::BulkString(None)
+                                    None => RespValue::BulkString(None),
                                 };
                                 let response_bytes = Bytes::from(response);
                                 socket.write_all(&response_bytes).await?;
@@ -110,12 +126,20 @@ async fn process(mut socket: TcpStream, db: DB) -> Result<(), Box<dyn Error>> {
                                     Some(RespValue::BulkString(Some(ms))),
                                 ) if px_bytes.to_ascii_lowercase() == b"px" => {
                                     let key_str = String::from_utf8_lossy(key).to_string();
-                                    let mut db_guard = db.lock().await;
                                     let expiry = String::from_utf8_lossy(ms)
                                         .parse::<u64>()
                                         .map(|ms| Instant::now() + Duration::from_millis(ms))
                                         .ok();
-                                    db_guard.insert(key_str, (value.clone(), expiry));
+                                    let (response_sender, response_receiver) = oneshot::channel();
+                                    db_sender
+                                        .send(DbOperation::Set(
+                                            key_str,
+                                            value.clone(),
+                                            expiry,
+                                            response_sender,
+                                        ))
+                                        .await?;
+                                    response_receiver.await?;
                                     let response = RespValue::SimpleString("OK".to_string());
                                     let response_bytes = Bytes::from(response);
                                     socket.write_all(&response_bytes).await?;
@@ -127,8 +151,17 @@ async fn process(mut socket: TcpStream, db: DB) -> Result<(), Box<dyn Error>> {
                                     None,
                                 ) => {
                                     let key_str = String::from_utf8_lossy(key).to_string();
-                                    let mut db_guard = db.lock().await;
-                                    db_guard.insert(key_str, (value.clone(), None));
+                                    let (response_sender, response_receiver) =
+                                        tokio::sync::oneshot::channel();
+                                    db_sender
+                                        .send(DbOperation::Set(
+                                            key_str,
+                                            value.clone(),
+                                            None,
+                                            response_sender,
+                                        ))
+                                        .await?;
+                                    response_receiver.await?;
                                     let response = RespValue::SimpleString("OK".to_string());
                                     let response_bytes = Bytes::from(response);
                                     socket.write_all(&response_bytes).await?;
@@ -163,6 +196,22 @@ async fn process(mut socket: TcpStream, db: DB) -> Result<(), Box<dyn Error>> {
                 let error = RespValue::Error(format!("Parse error: {}", e));
                 let error_bytes = Bytes::from(error);
                 socket.write_all(&error_bytes).await?;
+            }
+        }
+    }
+}
+async fn run_database(db_receiver: async_channel::Receiver<DbOperation>) {
+    let mut db = HashMap::new();
+
+    while let Ok(operation) = db_receiver.recv().await {
+        match operation {
+            DbOperation::Get(key, response_sender) => {
+                let value = db.get(&key).cloned();
+                let _ = response_sender.send(value);
+            }
+            DbOperation::Set(key, value, expiry, response_sender) => {
+                db.insert(key, (value, expiry));
+                let _ = response_sender.send(());
             }
         }
     }
